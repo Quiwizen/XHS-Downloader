@@ -9,3 +9,13 @@ __pycache__/
 /build/
 /dist/
 /output/
+/.venv/
+
+# Local-only：本机专用，不随上游维护
+# 上游只 ignore 了 /.venv/（带点），本机实际用的是 venv/
+venv/
+.DS_Store
+# 改代码前的本地备份
+*.bak
+*.bak.*
+

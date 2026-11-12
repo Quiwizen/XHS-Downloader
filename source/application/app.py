@@ -10,10 +10,11 @@ from asyncio import (
 )
 from contextlib import suppress
 from datetime import datetime
+from os import getenv
 from re import compile
 from textwrap import dedent
 from types import SimpleNamespace
-from typing import Annotated, Awaitable, Callable
+from typing import Annotated, Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
@@ -58,6 +59,10 @@ from ..module import (
 from ..translation import _, switch_language
 from .download import Download
 from .explore import Explore
+from .failed_records import FAILED_DIR, flush as flush_failures
+from .failed_records import append_failure
+from .failed_records import prune_failed, remove_failure
+from .task_progress import clear_progress, write_progress
 from .image import Image
 from .request import Html
 from .video import Video
@@ -323,24 +328,32 @@ class XHS:
         ):
             self.logging(_("提取小红书作品链接失败"), WARNING)
             return []
+        # 开工前先扫一遍失败清单：上一轮被风控拦下的链接，这几天可能已经补下载成功了，
+        # 先剔掉再统计，免得清单里全是「其实已经有文件」的条目
+        await self.prune_failed_records()
         statistics = new_statistics(len(urls))
         self.logging(_("共 {0} 个小红书作品待处理...").format(statistics.all))
-        result = [
-            await self.__deal_extract(
-                i,
-                download,
-                index,
-                check_record=check_record,
-                proxy=proxy,
-                count=statistics,
-                progress_callback=progress_callback,
-                task_id=task_id,
+        self.__begin_progress(statistics)
+        result = []
+        for i in urls:
+            result.append(
+                await self.__deal_extract(
+                    i,
+                    download,
+                    index,
+                    check_record=check_record,
+                    proxy=proxy,
+                    count=statistics,
+                    progress_callback=progress_callback,
+                    task_id=task_id,
+                )
             )
-            for i in urls
-        ]
+            self.__report_progress(statistics)
         self.show_statistics(
             statistics,
         )
+        self.__report_progress(statistics)
+        self.__flush_failures()
         if result_callback:
             result_callback(
                 {
@@ -379,16 +392,29 @@ class XHS:
         if not url:
             self.logging(_("提取小红书作品链接失败"), WARNING)
             return
+        # 开工前先把「其实已经下载成功」的条目从失败清单里剔掉
+        await self.prune_failed_records()
+        # 进度统计对象在两条分支之前就建好，保证 total 拿得到（index 分支也要传进去）
+        statistics = new_statistics(len(url))
         if index:
             await self.__deal_extract(
                 url[0],
                 download,
                 index,
                 check_record=check_record,
+                count=statistics,
             )
+            self.__report_progress(statistics)
         else:
-            statistics = new_statistics(len(url))
-            [
+            # 管理器注入的作品间隔（防风控）：仅在新作品之间生效，
+            # 「已存在下载记录而跳过」的作品不发网络请求，无需等待
+            try:
+                work_delay = float(getenv("XHS_WORK_DELAY") or 0)
+            except ValueError:
+                work_delay = 0.0
+            last = len(url) - 1
+            for idx, u in enumerate(url):
+                skipped_before = statistics.skip
                 await self.__deal_extract(
                     u,
                     download,
@@ -396,11 +422,65 @@ class XHS:
                     check_record=check_record,
                     count=statistics,
                 )
-                for u in url
-            ]
+                if (
+                    work_delay > 0
+                    and idx < last
+                    and statistics.skip == skipped_before
+                ):
+                    self.logging(
+                        _("等待 {0} 秒后处理下一个作品…").format(work_delay)
+                    )
+                    await sleep(work_delay)
+            self.__report_progress(statistics)
             self.show_statistics(
                 statistics,
             )
+            self.__flush_failures()
+            self.__report_progress(statistics)
+
+    def __begin_progress(self, statistics: SimpleNamespace) -> None:
+        """开工时先落一份「0 处理」的进度快照，外部立刻能看到 total。"""
+        clear_progress()
+        self.__report_progress(statistics)
+
+    def __report_progress(self, statistics: SimpleNamespace) -> None:
+        """把 statistics 的口径同步成进度快照：已处理＝成功＋跳过＋失败。
+
+        跳过的作品不落文件，只数文件会让进度条永远趴着；
+        这里一并带出 success / skip / fail，前端可以按口径分别显示。
+        """
+        write_progress(
+            total=getattr(statistics, "all", 0) or 0,
+            handled=statistics.success + statistics.skip + statistics.fail,
+            success=statistics.success,
+            skip=statistics.skip,
+            fail=statistics.fail,
+        )
+
+    def __flush_failures(self) -> None:
+        """把本轮「获取数据失败」的链接导出到 Volume/failed_records/，方便人工复核。"""
+        if not getattr(self.html, "failures", None):
+            return
+        try:
+            written = flush_failures(self.html.failures)
+        except Exception as error:  # 落盘失败不能打断主流程
+            self.logging(
+                _("失败清单导出失败（可手动到 {0} 查看）：{1}").format(
+                    FAILED_DIR,
+                    repr(error),
+                ),
+                WARNING,
+            )
+            return
+        if not written:
+            return
+        self.logging(
+            _("失败清单已导出：{0}，共 {1} 条，查看 {2}").format(
+                written["dir"],
+                written["total"],
+                written["md_name"],
+            ),
+        )
 
     async def extract_links(
         self,
@@ -454,10 +534,84 @@ class XHS:
         )
         namespace = self.__generate_data_object(html)
         if not namespace:
-            self.logging(_("{0} 获取数据失败").format(id_), ERROR)
+            # 小红书对不可访问的笔记也返回 200（跳到 /404 落地页），
+            # 靠落地页是否带 errorCode 区分「内容没了」与「token 失效」，
+            # 两条都记到失败清单里，任务结束导出到 Volume/failed_records/
+            final_url = getattr(self.html, "last_final_url", "") or ""
+            # 立刻落盘（不等任务跑完）：批量任务中途/被中断也能在 failed_latest 看到
+            item = append_failure(
+                self.html.failures,
+                url,
+                note_id=id_,
+                final_url=final_url,
+            )
+            self.logging(
+                _("{0} 获取数据失败").format(id_) + f"（{item['reason_short']}）",
+                ERROR,
+            )
             count.fail += 1
             return {}
         return namespace
+
+    def _query_done_ids(self, ids: list[str]) -> set[str]:
+        """同步查 ExploreID.db —— 哪些作品其实已经下载成功过。
+
+        注意：这里必须保持**同步 def**。它会在 prune_failed() 的同步回调里被调用，
+        曾经误写成 `async def`，调用方没 await 时拿到的是 coroutine 对象——
+        coroutine 永远为 truthy，于是「取数失败」的每条都被误判成「其实已下载成功」
+        而从失败清单里删掉，反而把失败记录整批丢了。
+        函数体全是标准库 sqlite3，本来就没有任何 await，不该是 async。
+
+        为什么用标准库 sqlite3 直读、不走 aiosqlite 的 recorder：
+        这里要的是「批量 + 同步」，且必须在 prune 的同步回调里用，
+        直接开个只读连接最简单，也避免碰 aiosqlite 的内部对象。
+        读不到 / 表不存在时返回空集合（宁可不剔除，也不能误删清单）。
+        """
+        done: set[str] = set()
+        if not ids:
+            return done
+        db = VOLUME / "ExploreID.db"
+        if not db.exists():
+            return done
+        import sqlite3
+
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return done
+        try:
+            # 分批：SQLite 单个语句的参数有上限（默认 999 左右）
+            for start in range(0, len(ids), 400):
+                chunk = ids[start : start + 400]
+                marks = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT ID FROM explore_id WHERE ID IN ({marks});",
+                    tuple(chunk),
+                ).fetchall()
+                done.update(str(r[0]) for r in rows)
+        except sqlite3.Error:
+            return done
+        finally:
+            conn.close()
+        return done
+
+    async def prune_failed_records(self) -> dict[str, Any]:
+        """把失败清单里「后来又下载成功」的条目剔掉（任务开始 / 手动触发时用）。"""
+
+        def collect(ids: list[str]) -> set[str]:
+            return self._query_done_ids(list(ids))
+
+        try:
+            result = prune_failed(collect)
+        except Exception as error:
+            self.logging(
+                _("剔除失败清单中已补下载条目失败：{0}").format(repr(error)),
+                WARNING,
+            )
+            return {"ok": False, "msg": f"剔除失败：{error!r}"}
+        if result.get("changed"):
+            self.logging(_("已从失败清单剔除 {0} 条已成功下载的条目").format(len(result["removed"])))
+        return result
 
     async def _check_existing_record(
         self,
@@ -549,6 +703,16 @@ class XHS:
             proxy=proxy,
         )
         if not isinstance(namespace, Namespace):
+            # 取数失败：这条可能早就补下载成功了（上一轮被风控拦下、这一轮换链接跑通了），
+            # 那就把它从失败清单里摘掉，别让清单里混着其实有文件的人
+            # 用 `id_ in (结果)` 而不是 `if 结果`：万一 _query_done_ids 哪天又被写成
+            # async，这里拿到 coroutine（恒为真）会把失败记录整批误删；成员判断则安全。
+            done_now = self._query_done_ids([id_])
+            if isinstance(done_now, (set, frozenset, list, tuple)) and id_ in done_now:
+                if remove_failure(id_)["changed"]:
+                    self.logging(
+                        _("已从失败清单剔除（该作品实际已下载成功）：{0}").format(id_)
+                    )
             return namespace
         if not (
             data := self._extract_data(
@@ -571,6 +735,11 @@ class XHS:
             progress_callback=progress_callback,
             task_id=task_id,
         )
+        # 这条刚成功下载完：它要是还挂在失败清单里（之前那轮被风控拦过），就顺手摘掉
+        if remove_failure(id_)["changed"]:
+            self.logging(
+                _("已从失败清单剔除（该作品已成功下载）：{0}").format(id_)
+            )
         self.logging(_("作品处理完成：{0}").format(id_))
         return data
 
@@ -851,6 +1020,7 @@ class XHS:
                     msg = _("获取小红书作品数据成功")
                 else:
                     msg = _("获取小红书作品数据失败")
+            self.__flush_failures()
             return ExtractData(message=msg, params=extract, data=data)
 
     async def run_mcp_server(
