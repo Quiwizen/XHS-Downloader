@@ -24,6 +24,11 @@ class Html:
         self.timeout = manager.timeout
         self.proxy = manager.proxy
         self.impersonate = manager.impersonate
+        # 最近一次请求的最终跳转地址（小红书对不可访问笔记也返回 200，
+        # 靠它才能区分「内容没了」与「token 失效」）
+        self.last_final_url: str = ""
+        # 本次运行里「获取数据失败」的待落盘清单
+        self.failures: list = []
 
     @retry
     async def request_url(
@@ -55,8 +60,10 @@ class Html:
                 )
             await sleep_time(self.manager.avg_delay)
             response.raise_for_status()
-            return response.text if content else str(response.url)
+            self.last_final_url = str(getattr(response, "url", "") or "")
+            return response.text if content else self.last_final_url
         except RequestException as error:
+            self.last_final_url = ""
             logging(
                 self.print,
                 _("网络异常，{0} 请求失败: {1}").format(url, repr(error)),

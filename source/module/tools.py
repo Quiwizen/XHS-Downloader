@@ -1,5 +1,6 @@
 from asyncio import sleep
 from math import log
+from os import getenv
 from random import lognormvariate
 from typing import Callable
 
@@ -74,9 +75,16 @@ def compare_versions(
 
 
 def get_wait_time(
-    avg_delay: float | int = 6.0,
+    avg_delay: float | int | None = None,
     sigma: float = 0.6,
 ) -> float:
+    # 支持由环境变量覆盖默认请求间隔（管理器用于防风控），未设置时保持项目原默认值 6.0
+    if avg_delay is None:
+        try:
+            avg_delay = float(getenv("XHS_AVG_DELAY") or 6.0)
+        except ValueError:
+            avg_delay = 6.0
+    avg_delay = max(0.5, float(avg_delay))
     mu = log(avg_delay) - (sigma**2 / 2)
     delay = lognormvariate(mu, sigma)
     min_delay = avg_delay * 0.2
